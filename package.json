@@ -1,0 +1,12 @@
+{
+  "name": "cedar-hedge-counseling",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cedar Hedge Counseling website and AWS infrastructure",
+  "scripts": {
+    "dev": "python3 -m http.server 8000 --directory site",
+    "preview": "python3 -m http.server 8000 --directory site",
+    "check": "node --check site/script.js && python3 scripts/check_site.py",
+    "test": "python3 -m unittest discover -s tests -v"
+  }
+}

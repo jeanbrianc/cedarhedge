@@ -1,0 +1,425 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Cedar Hedge Counseling static website and disabled-by-default appointment request backend.
+Parameters:
+  SiteDomainName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$'
+    Description: Optional apex domain that you own, such as cedarhedgecounseling.com.
+  HostedZoneId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^Z[A-Z0-9]+$'
+    Description: Existing public Route 53 zone for the domain. Domain registration is separate.
+  IntakeEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Keep false until the practice authorizes intake and its operating workflow is ready.
+  AllowedOrigin:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^https://[a-z0-9.-]+$'
+    Description: Exact website origin for browser requests, without a trailing slash.
+  RetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 365
+    Description: Request TTL in days, subject to practice retention decisions and backup retention.
+  NotificationFrom:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    Description: Sender covered by an existing SES verified identity in this region.
+  NotificationTo:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    Description: Operator mailbox receiving generic notifications without patient details.
+  SesIdentityArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws:ses:[a-z0-9-]+:[0-9]{12}:identity/.+$'
+    Description: Existing SES identity ARN covering NotificationFrom; this stack does not provision email hosting.
+Rules:
+  DomainConfiguration:
+    Assertions:
+      - Assert: !Or
+          - !And [!Equals [!Ref SiteDomainName, ''], !Equals [!Ref HostedZoneId, '']]
+          - !And [!Not [!Equals [!Ref SiteDomainName, '']], !Not [!Equals [!Ref HostedZoneId, '']]]
+        AssertDescription: Set both SiteDomainName and HostedZoneId, or leave both empty.
+  NotificationConfiguration:
+    Assertions:
+      - Assert: !Or
+          - !And [!Equals [!Ref NotificationFrom, ''], !Equals [!Ref NotificationTo, ''], !Equals [!Ref SesIdentityArn, '']]
+          - !And [!Not [!Equals [!Ref NotificationFrom, '']], !Not [!Equals [!Ref NotificationTo, '']], !Not [!Equals [!Ref SesIdentityArn, '']]]
+        AssertDescription: Set all notification parameters together, or leave all empty.
+  IntakeConfiguration:
+    Assertions:
+      - Assert: !Or
+          - !Equals [!Ref IntakeEnabled, 'false']
+          - !And [!Not [!Equals [!Ref AllowedOrigin, '']], !Not [!Equals [!Ref NotificationFrom, '']], !Not [!Equals [!Ref NotificationTo, '']], !Not [!Equals [!Ref SesIdentityArn, '']]]
+        AssertDescription: Enabling intake requires an explicit website origin and working email notification configuration.
+Conditions:
+  HasDomain: !Not [!Equals [!Ref SiteDomainName, '']]
+  HasNotifications: !Not [!Equals [!Ref NotificationFrom, '']]
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 20
+    CodeUri: backend/
+    Environment:
+      Variables:
+        REQUESTS_TABLE: !Ref RequestsTable
+        AWS_RETRY_MODE: standard
+        AWS_MAX_ATTEMPTS: '3'
+Resources:
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      VersioningConfiguration: {Status: Enabled}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      LifecycleConfiguration:
+        Rules:
+          - Id: TrimOldAssetVersions
+            Status: Enabled
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
+  SiteOriginAccess:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-s3'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudFrontReadOnly
+            Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub '${SiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt SiteBucket.Arn, !Sub '${SiteBucket.Arn}/*']
+            Condition:
+              Bool: {aws:SecureTransport: 'false'}
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasDomain
+    Properties:
+      DomainName: !Ref SiteDomainName
+      SubjectAlternativeNames: [!Sub 'www.${SiteDomainName}']
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref SiteDomainName
+          HostedZoneId: !Ref HostedZoneId
+        - DomainName: !Sub 'www.${SiteDomainName}'
+          HostedZoneId: !Ref HostedZoneId
+  StaticCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${AWS::StackName}-static'
+        MinTTL: 0
+        DefaultTTL: 3600
+        MaxTTL: 86400
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          CookiesConfig: {CookieBehavior: none}
+          HeadersConfig: {HeaderBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+  ApiCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${AWS::StackName}-no-api-cache'
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          CookiesConfig: {CookieBehavior: none}
+          HeadersConfig: {HeaderBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+  ApiOriginPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub '${AWS::StackName}-api-origin'
+        CookiesConfig: {CookieBehavior: none}
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers: [Origin, Content-Type, Idempotency-Key]
+        QueryStringsConfig: {QueryStringBehavior: none}
+  SecurityHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${AWS::StackName}-security-headers'
+        SecurityHeadersConfig:
+          ContentTypeOptions: {Override: true}
+          FrameOptions: {FrameOption: DENY, Override: true}
+          ReferrerPolicy: {ReferrerPolicy: no-referrer, Override: true}
+          StrictTransportSecurity: {AccessControlMaxAgeSec: 31536000, Override: true}
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'"
+            Override: true
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        IPV6Enabled: true
+        Comment: Cedar Hedge Counseling
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Aliases: !If [HasDomain, [!Ref SiteDomainName, !Sub 'www.${SiteDomainName}'], !Ref 'AWS::NoValue']
+        ViewerCertificate: !If
+          - HasDomain
+          - {AcmCertificateArn: !Ref Certificate, SslSupportMethod: sni-only, MinimumProtocolVersion: TLSv1.2_2021}
+          - {CloudFrontDefaultCertificate: true}
+        Origins:
+          - Id: website
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccess.Id
+            S3OriginConfig: {OriginAccessIdentity: ''}
+          - Id: requests
+            DomainName: !Sub '${RequestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+            CustomOriginConfig: {OriginProtocolPolicy: https-only, OriginSSLProtocols: [TLSv1.2]}
+        DefaultCacheBehavior:
+          TargetOriginId: website
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: !Ref StaticCachePolicy
+          ResponseHeadersPolicyId: !Ref SecurityHeaders
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: requests
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: !Ref ApiCachePolicy
+            OriginRequestPolicyId: !Ref ApiOriginPolicy
+            ResponseHeadersPolicyId: !Ref SecurityHeaders
+  DomainRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Condition: HasDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      RecordSets:
+        - Name: !Ref SiteDomainName
+          Type: A
+          AliasTarget: {DNSName: !GetAtt Distribution.DomainName, HostedZoneId: Z2FDTNDATAQYW2}
+        - Name: !Ref SiteDomainName
+          Type: AAAA
+          AliasTarget: {DNSName: !GetAtt Distribution.DomainName, HostedZoneId: Z2FDTNDATAQYW2}
+        - Name: !Sub 'www.${SiteDomainName}'
+          Type: A
+          AliasTarget: {DNSName: !GetAtt Distribution.DomainName, HostedZoneId: Z2FDTNDATAQYW2}
+        - Name: !Sub 'www.${SiteDomainName}'
+          Type: AAAA
+          AliasTarget: {DNSName: !GetAtt Distribution.DomainName, HostedZoneId: Z2FDTNDATAQYW2}
+  RequestsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
+      AttributeDefinitions:
+        - {AttributeName: requestId, AttributeType: S}
+        - {AttributeName: status, AttributeType: S}
+        - {AttributeName: createdAt, AttributeType: S}
+      KeySchema: [{AttributeName: requestId, KeyType: HASH}]
+      GlobalSecondaryIndexes:
+        - IndexName: by-status
+          KeySchema: [{AttributeName: status, KeyType: HASH}, {AttributeName: createdAt, KeyType: RANGE}]
+          Projection: {ProjectionType: KEYS_ONLY}
+      SSESpecification: {SSEEnabled: true, SSEType: KMS}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      TimeToLiveSpecification: {AttributeName: expiresAt, Enabled: true}
+      StreamSpecification: {StreamViewType: KEYS_ONLY}
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties: {RetentionInDays: 30}
+  RequestApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: '$default'
+      DefaultRouteSettings: {ThrottlingBurstLimit: 5, ThrottlingRateLimit: 2}
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","status":"$context.status","routeKey":"$context.routeKey"}'
+  RequestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.handler
+      Environment:
+        Variables:
+          INTAKE_ENABLED: !Ref IntakeEnabled
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+          RETENTION_DAYS: !Ref RetentionDays
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:GetItem]
+              Resource: !GetAtt RequestsTable.Arn
+      Events:
+        Submit:
+          Type: HttpApi
+          Properties: {ApiId: !Ref RequestApi, Path: /api/appointment-requests, Method: POST}
+  RequestFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${RequestFunction}'
+      RetentionInDays: 30
+  NotificationFailures:
+    Type: AWS::SQS::Queue
+    Condition: HasNotifications
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties: {SqsManagedSseEnabled: true, MessageRetentionPeriod: 1209600}
+  NotificationFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasNotifications
+    Properties:
+      Handler: notify.handler
+      Environment:
+        Variables:
+          NOTIFY_FROM: !Ref NotificationFrom
+          NOTIFY_TO: !Ref NotificationTo
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt RequestsTable.Arn
+            - Effect: Allow
+              Action: [ses:SendEmail]
+              Resource: !Ref SesIdentityArn
+              Condition:
+                StringEquals: {ses:FromAddress: !Ref NotificationFrom}
+                ForAllValues:StringEquals: {ses:Recipients: [!Ref NotificationTo]}
+                "Null": {ses:Recipients: 'false'}
+            - Effect: Allow
+              Action: [sqs:SendMessage]
+              Resource: !GetAtt NotificationFailures.Arn
+      Events:
+        NewRequests:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt RequestsTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 1
+            MaximumRetryAttempts: 5
+            MaximumRecordAgeInSeconds: 3600
+            BisectBatchOnFunctionError: true
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            DestinationConfig:
+              OnFailure: {Type: SQS, Destination: !GetAtt NotificationFailures.Arn}
+  NotificationFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Condition: HasNotifications
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NotificationFunction}'
+      RetentionInDays: 30
+  RequestErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Request handler failures; configure operational alert routing before opening intake.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref RequestFunction}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  ApiServerErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: HTTP 5xx responses, including requests rejected while intake is closed.
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions: [{Name: ApiId, Value: !Ref RequestApi}, {Name: Stage, Value: '$default'}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  NotificationBacklog:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasNotifications
+    Properties:
+      AlarmDescription: Notification retries exhausted. Inspect the failure queue and pending records.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt NotificationFailures.QueueName}]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+Outputs:
+  SiteUrl:
+    Description: Website origin; upload site assets after the stack is created.
+    Value: !If [HasDomain, !Sub 'https://${SiteDomainName}', !Sub 'https://${Distribution.DomainName}']
+  CloudFrontUrl:
+    Description: AWS-generated website address.
+    Value: !Sub 'https://${Distribution.DomainName}'
+  SiteBucketName:
+    Description: Private static-asset bucket used by the upload script.
+    Value: !Ref SiteBucket
+  DistributionId:
+    Description: CloudFront distribution used by the upload script.
+    Value: !Ref Distribution
+  RequestsTableName:
+    Description: IAM-protected request storage for the operator CLI.
+    Value: !Ref RequestsTable
+  IntakeEnabled:
+    Description: Current server-side intake state, independent of the website UI.
+    Value: !Ref IntakeEnabled
+  NotificationFailureQueueUrl:
+    Condition: HasNotifications
+    Description: Queue containing notification failure metadata for operator investigation.
+    Value: !Ref NotificationFailures
